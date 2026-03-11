@@ -6,10 +6,20 @@ import multer from 'multer';
 import path from 'path';
 import fs from 'fs';
 import { fileURLToPath } from 'url';
-import { Pool } from 'pg';
+import { pool } from './db.js';
+import { Router } from 'express';
 
-
-
+async function listarUsuarios() {
+        try {
+   const res = await pool.query('SELECT * from usuario')
+   console.log(res) 
+} catch (err) {
+   console.error(err);
+} finally {
+   await pool.end()
+}
+    }
+    
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -156,3 +166,5 @@ const PORT = 3333;
 server.listen(PORT, LOCAL_IP, () => {
     console.log(`✅ Servidor rodando em http://localhost:${PORT} e ${LOCAL_IP}`);
 });
+
+listarUsuarios();
