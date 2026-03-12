@@ -43,55 +43,42 @@ const upload = multer({ storage });
 
 app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
 
-
+// =========================
+// HELPERS
+// =========================
 
 function addConnection(roomId, userId, socket) {
     if (!activeConnections.has(roomId)) {
         activeConnections.set(roomId, new Map());
     }
-
     const roomConnections = activeConnections.get(roomId);
-
     if (!roomConnections.has(userId)) {
         roomConnections.set(userId, new Set());
     }
-
     roomConnections.get(userId).add(socket);
 }
 
 function removeConnection(roomId, userId, socket) {
     const roomConnections = activeConnections.get(roomId);
     if (!roomConnections) return false;
-
     const userSockets = roomConnections.get(userId);
     if (!userSockets) return false;
 
     userSockets.delete(socket);
-
     if (userSockets.size === 0) {
         roomConnections.delete(userId);
     }
-
     if (roomConnections.size === 0) {
         activeConnections.delete(roomId);
         return true;
     }
-
     return !roomConnections.has(userId);
-}
-
-function getConnectedUserIds(roomId) {
-    const roomConnections = activeConnections.get(roomId);
-    if (!roomConnections) return [];
-    return [...roomConnections.keys()];
 }
 
 function getConnectedSocketsInRoom(roomId) {
     const roomConnections = activeConnections.get(roomId);
     if (!roomConnections) return [];
-
     const sockets = [];
-
     for (const userSockets of roomConnections.values()) {
         for (const socket of userSockets) {
             if (socket.readyState === WebSocket.OPEN) {
@@ -99,14 +86,12 @@ function getConnectedSocketsInRoom(roomId) {
             }
         }
     }
-
     return sockets;
 }
 
 function broadcast(roomId, payload, excludeSocket = null) {
     const message = JSON.stringify(payload);
     const sockets = getConnectedSocketsInRoom(roomId);
-
     for (const client of sockets) {
         if (client !== excludeSocket) {
             client.send(message);
@@ -116,16 +101,14 @@ function broadcast(roomId, payload, excludeSocket = null) {
 
 async function handleDisconnect(socket, reason = 'unknown') {
     const { roomId, userId } = socket;
-
     if (!roomId || !userId || socket._disconnected) return;
 
     socket._disconnected = true;
-
     removeConnection(roomId, userId, socket);
 
     const key = `${roomId}:${userId}`;
 
-    // evita remover o usuário se ele reconectar rapidamente
+    // Evita definir como offline se ele reconectar rapidamente (ex: F5)
     const timer = setTimeout(async () => {
         try {
             const stillConnected = [...wss.clients].some(
@@ -140,19 +123,21 @@ async function handleDisconnect(socket, reason = 'unknown') {
                 return;
             }
 
+            // ATUALIZA status para offline ao invés de DELETAR
             await pool.query(
-                'DELETE FROM room_participants WHERE room_id = $1 AND user_id = $2',
+                "UPDATE room_participants SET status = 'offline' WHERE room_id = $1 AND user_id = $2",
                 [roomId, userId]
             );
 
             broadcast(roomId, {
-                type: 'participant.left',
-                participantId: userId
+                type: 'participant.status_change',
+                participantId: userId,
+                status: 'offline'
             });
 
-            console.log(`Usuário ${userId} saiu da sala ${roomId}. Motivo: ${reason}`);
+            console.log(`Usuário ${userId} agora está offline na sala ${roomId}.`);
         } catch (err) {
-            console.error('Erro ao remover participante:', err);
+            console.error('Erro ao atualizar status do participante:', err);
         } finally {
             disconnectTimers.delete(key);
         }
@@ -167,7 +152,6 @@ async function handleDisconnect(socket, reason = 'unknown') {
 
 app.post('/uploads/avatar', upload.single('file'), (req, res) => {
     if (!req.file) return res.status(400).json({ error: 'Nenhum arquivo enviado' });
-
     res.json({
         avatarUrl: `/uploads/${req.file.filename}`,
         filename: req.file.filename
@@ -176,26 +160,21 @@ app.post('/uploads/avatar', upload.single('file'), (req, res) => {
 
 app.post('/register', async (req, res) => {
     const { username, password, email, avatarUrl, displayName } = req.body;
-
     try {
         const userExists = await pool.query(
             'SELECT id FROM users WHERE username = $1 OR email = $2',
             [username, email]
         );
-
         if (userExists.rows.length > 0) {
             return res.status(400).json({ error: 'Usuário ou Email já cadastrado' });
         }
-
         const finalDisplayName = displayName || username;
-
         const newUserRes = await pool.query(
             `INSERT INTO users (username, password, email, display_name, avatar_url) 
              VALUES ($1, $2, $3, $4, $5) 
              RETURNING id, username, email, display_name as "displayName", avatar_url as "avatarUrl"`,
             [username, password, email, finalDisplayName, avatarUrl]
         );
-
         res.status(201).json(newUserRes.rows[0]);
     } catch (err) {
         console.error(err);
@@ -205,17 +184,14 @@ app.post('/register', async (req, res) => {
 
 app.post('/sessions', async (req, res) => {
     const { username, password, roomId } = req.body;
-
     try {
         const userRes = await pool.query(
             'SELECT * FROM users WHERE username = $1 AND password = $2',
             [username, password]
         );
-
         if (userRes.rows.length === 0) {
             return res.status(401).json({ error: 'Credenciais inválidas' });
         }
-
         const user = userRes.rows[0];
 
         await pool.query(
@@ -223,8 +199,12 @@ app.post('/sessions', async (req, res) => {
             [roomId]
         );
 
+        // Garante que o participante existe e define como online
         await pool.query(
-            'INSERT INTO room_participants (room_id, user_id) VALUES ($1, $2) ON CONFLICT DO NOTHING',
+            `INSERT INTO room_participants (room_id, user_id, status) 
+             VALUES ($1, $2, 'online') 
+             ON CONFLICT (room_id, user_id) 
+             DO UPDATE SET status = 'online'`,
             [roomId, user.id]
         );
 
@@ -247,23 +227,17 @@ app.post('/sessions', async (req, res) => {
 
 app.get('/rooms/:roomId/messages', async (req, res) => {
     const { roomId } = req.params;
-
     try {
         const result = await pool.query(
             `SELECT 
-                m.id,
-                m.user_id as "userId",
-                m.content,
-                m.created_at,
-                u.display_name as "userName",
-                u.avatar_url as "userAvatarUrl"
+                m.id, m.user_id as "userId", m.content, m.created_at,
+                u.display_name as "userName", u.avatar_url as "userAvatarUrl"
              FROM messages m
              JOIN users u ON m.user_id = u.id
              WHERE m.room_id = $1
              ORDER BY m.created_at ASC`,
             [roomId]
         );
-
         res.json({ roomId, messages: result.rows });
     } catch (err) {
         console.error(err);
@@ -273,26 +247,19 @@ app.get('/rooms/:roomId/messages', async (req, res) => {
 
 app.get('/rooms/:roomId/participants', async (req, res) => {
     const { roomId } = req.params;
-
     try {
-        // Retorna participantes atualmente conectados
-        const connectedUserIds = getConnectedUserIds(roomId);
-
-        if (connectedUserIds.length === 0) {
-            return res.json({ participants: [] });
-        }
-
         const result = await pool.query(
             `SELECT 
                 u.id,
                 u.username,
                 u.display_name as "displayName",
-                u.avatar_url as "avatarUrl"
+                u.avatar_url as "avatarUrl",
+                rp.status
              FROM users u
-             WHERE u.id = ANY($1::uuid[])`,
-            [connectedUserIds]
+             JOIN room_participants rp ON u.id = rp.user_id
+             WHERE rp.room_id = $1`,
+            [roomId]
         );
-
         res.json({ participants: result.rows });
     } catch (err) {
         console.error(err);
@@ -315,7 +282,6 @@ wss.on('connection', async (socket, request) => {
     }
 
     const key = `${roomId}:${userId}`;
-
     if (disconnectTimers.has(key)) {
         clearTimeout(disconnectTimers.get(key));
         disconnectTimers.delete(key);
@@ -326,9 +292,7 @@ wss.on('connection', async (socket, request) => {
     socket.isAlive = true;
     socket._disconnected = false;
 
-    socket.on('pong', () => {
-        socket.isAlive = true;
-    });
+    socket.on('pong', () => { socket.isAlive = true; });
 
     socket.on('error', async (err) => {
         console.error(`Erro no socket userId=${userId}:`, err);
@@ -336,19 +300,12 @@ wss.on('connection', async (socket, request) => {
     });
 
     socket.on('close', async (code, reason) => {
-        console.log(
-            `Socket fechado. userId=${userId}, roomId=${roomId}, code=${code}, reason=${reason?.toString()}`
-        );
-
+        console.log(`Socket fechado. userId=${userId}, roomId=${roomId}`);
         await handleDisconnect(socket, 'close');
     });
 
     try {
-        const userRes = await pool.query(
-            'SELECT * FROM users WHERE id = $1',
-            [userId]
-        );
-
+        const userRes = await pool.query('SELECT * FROM users WHERE id = $1', [userId]);
         const user = userRes.rows[0];
 
         if (!user) {
@@ -361,28 +318,24 @@ wss.on('connection', async (socket, request) => {
 
         addConnection(roomId, userId, socket);
 
+        // Atualiza status para online no banco
         await pool.query(
-            'INSERT INTO room_participants (room_id, user_id) VALUES ($1, $2) ON CONFLICT DO NOTHING',
-            [roomId, user.id]
+            `INSERT INTO room_participants (room_id, user_id, status) 
+             VALUES ($1, $2, 'online') 
+             ON CONFLICT (room_id, user_id) 
+             DO UPDATE SET status = 'online'`,
+            [roomId, userId]
         );
 
-        const connectedUserIds = getConnectedUserIds(roomId);
-
-        let participants = [];
-        if (connectedUserIds.length > 0) {
-            const participantsRes = await pool.query(
-                `SELECT 
-                    u.id,
-                    u.username,
-                    u.display_name as "displayName",
-                    u.avatar_url as "avatarUrl"
-                 FROM users u
-                 WHERE u.id = ANY($1::uuid[])`,
-                [connectedUserIds]
-            );
-
-            participants = participantsRes.rows;
-        }
+        // Busca lista completa de participantes (online e offline)
+        const participantsRes = await pool.query(
+            `SELECT 
+                u.id, u.username, u.display_name as "displayName", u.avatar_url as "avatarUrl", rp.status
+             FROM users u
+             JOIN room_participants rp ON u.id = rp.user_id
+             WHERE rp.room_id = $1`,
+            [roomId]
+        );
 
         socket.send(JSON.stringify({
             type: 'room.joined',
@@ -391,14 +344,17 @@ wss.on('connection', async (socket, request) => {
                 id: user.id,
                 username: user.username,
                 displayName: user.display_name,
-                avatarUrl: user.avatar_url
+                avatarUrl: user.avatar_url,
+                status: 'online'
             },
-            participants
+            participants: participantsRes.rows
         }));
 
         if (!alreadyOnline) {
             broadcast(roomId, {
-                type: 'participant.joined',
+                type: 'participant.status_change',
+                participantId: userId,
+                status: 'online',
                 participant: {
                     id: user.id,
                     username: user.username,
@@ -407,17 +363,14 @@ wss.on('connection', async (socket, request) => {
                 }
             }, socket);
 
-            console.log(`✅ Usuário ${userId} conectado na sala ${roomId}`);
+            console.log(`✅ Usuário ${userId} online na sala ${roomId}`);
         }
 
         socket.on('message', async (rawData) => {
             try {
                 const data = JSON.parse(rawData.toString());
-
                 if (data.type === 'message.send') {
-                    if (!data.content || !String(data.content).trim()) {
-                        return;
-                    }
+                    if (!data.content || !String(data.content).trim()) return;
 
                     const msgRes = await pool.query(
                         `INSERT INTO messages (room_id, user_id, content) 
@@ -427,7 +380,6 @@ wss.on('connection', async (socket, request) => {
                     );
 
                     const savedMsg = msgRes.rows[0];
-
                     broadcast(roomId, {
                         type: 'message.new',
                         message: {
@@ -447,25 +399,19 @@ wss.on('connection', async (socket, request) => {
     }
 });
 
-
 // HEARTBEAT PING/PONG
-
 const heartbeatInterval = setInterval(() => {
     wss.clients.forEach((socket) => {
         if (socket.isAlive === false) {
-            console.log(`Encerrando conexão morta: userId=${socket.userId}`);
             socket.terminate();
             return;
         }
-
         socket.isAlive = false;
         socket.ping();
     });
 }, 30000);
 
-wss.on('close', () => {
-    clearInterval(heartbeatInterval);
-});
+wss.on('close', () => clearInterval(heartbeatInterval));
 
 server.listen(PORT, LOCAL_IP, () => {
     console.log(`✅ Servidor rodando em http://${LOCAL_IP}:${PORT}`);
