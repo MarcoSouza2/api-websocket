@@ -7,7 +7,7 @@ export const pool = new Pool({
   port: 5431,
   user: "postgres",
   password: "8796",
-  database: "chatdb",
+  database: "postgres",
 });
 
 pool.connect()
