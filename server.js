@@ -43,39 +43,61 @@ app.post('/uploads/avatar', upload.single('file'), (req, res) => {
     });
 });
 
-app.post('/sessions', async (req, res) => {
-    const { name, password, roomId, avatarUrl } = req.body;
+app.post('/register', async (req, res) => {
+    const { username, password, email, avatarUrl, displayName } = req.body;
 
     try {
-        // Room
+        // Check if user or email already exists
+        const userExists = await pool.query(
+            'SELECT id FROM users WHERE username = $1 OR email = $2',
+            [username, email]
+        );
+
+        if (userExists.rows.length > 0) {
+            return res.status(400).json({ error: 'Usuário ou Email já cadastrado' });
+        }
+
+        const finalDisplayName = displayName || username;
+        // Insert new user
+        // We set display_name = username as requested
+        const newUserRes = await pool.query(
+            `INSERT INTO users (username, password, email, display_name, avatar_url) 
+             VALUES ($1, $2, $3, $4, $5) 
+             RETURNING id, username, email, display_name as "displayName", avatar_url as "avatarUrl"`,
+            [username, password, email, finalDisplayName, avatarUrl]
+        );
+
+        res.status(201).json(newUserRes.rows[0]);
+    } catch (err) {
+        console.error(err);
+        res.status(500).json({ error: 'Erro ao registrar usuário' });
+    }
+});
+
+app.post('/sessions', async (req, res) => {
+    // We removed avatarUrl from here because it's usually set during register or profile edit
+    const { username, password, roomId } = req.body;
+
+    try {
+        // 1. Verify User Credentials
+        const userRes = await pool.query(
+            'SELECT * FROM users WHERE username = $1 AND password = $2',
+            [username, password]
+        );
+        
+        if (userRes.rows.length === 0) {
+            return res.status(401).json({ error: 'Credenciais inválidas' });
+        }
+
+        const user = userRes.rows[0];
+
+        // 2. Ensure Room exists
         await pool.query(
             'INSERT INTO rooms (id) VALUES ($1) ON CONFLICT (id) DO NOTHING',
             [roomId]
         );
 
-        // User
-        const userRes = await pool.query(
-            'SELECT * FROM users WHERE name = $1 AND password = $2',
-            [name, password]
-        );
-        
-        let user;
-
-        if (userRes.rows.length > 0) {
-            // Exists
-            user = userRes.rows[0];
-        } else {
-            // Doesn't exist
-            const newUserRes = await pool.query(
-                `INSERT INTO users (name, password, avatar_url) 
-                 VALUES ($1, $2, $3) 
-                 RETURNING *`, 
-                [name, password, avatarUrl]
-            );
-            user = newUserRes.rows[0];
-        }
-
-        // Participants
+        // 3. Add Participant to Room
         await pool.query(
             'INSERT INTO room_participants (room_id, user_id) VALUES ($1, $2) ON CONFLICT DO NOTHING',
             [roomId, user.id]
@@ -86,14 +108,15 @@ app.post('/sessions', async (req, res) => {
             roomId: roomId,
             user: {
                 id: user.id,
-                name: user.name,
+                username: user.username,
+                displayName: user.display_name,
                 avatarUrl: user.avatar_url
-            }, //no password
+            },
             wsUrl: `ws://192.168.100.25:3333?roomId=${roomId}&userId=${user.id}`
         });
     } catch (err) {
         console.error(err);
-        res.status(500).json({ error: 'Erro ao criar sessão' });
+        res.status(500).json({ error: 'Erro ao iniciar sessão' });
     }
 });
 
@@ -101,7 +124,7 @@ app.get('/rooms/:roomId/messages', async (req, res) => {
     const { roomId } = req.params;
     try {
         const result = await pool.query(
-            `SELECT m.id, m.user_id as "userId", m.content, m.created_at, u.name as "userName", u.avatar_url as "userAvatarUrl"
+            `SELECT m.id, m.user_id as "userId", m.content, m.created_at, u.display_name as "userName", u.avatar_url as "userAvatarUrl"
              FROM messages m
              JOIN users u ON m.user_id = u.id
              WHERE m.room_id = $1
@@ -118,7 +141,7 @@ app.get('/rooms/:roomId/participants', async (req, res) => {
     const { roomId } = req.params;
     try {
         const result = await pool.query(
-            `SELECT u.id, u.name, u.avatar_url as "avatarUrl" FROM users u
+            `SELECT u.id, u.username, u.display_name as "displayName", u.avatar_url as "avatarUrl" FROM users u
              JOIN room_participants rp ON u.id = rp.user_id
              WHERE rp.room_id = $1`,
             [roomId]
@@ -147,7 +170,7 @@ wss.on('connection', async (socket, request) => {
 
         // Participants in room
         const participantsRes = await pool.query(
-            `SELECT u.id, u.name, u.avatar_url as "avatarUrl" 
+            `SELECT u.id, u.username, display_name as "displayName", u.avatar_url as "avatarUrl" 
             FROM users u 
             JOIN room_participants rp ON u.id = rp.user_id 
             WHERE rp.room_id = $1`,
@@ -157,11 +180,23 @@ wss.on('connection', async (socket, request) => {
         socket.send(JSON.stringify({
             type: 'room.joined',
             roomId,
-            participant: { ...user, avatarUrl: user.avatar_url },
+            participant: { 
+                id: user.id, 
+                username: user.username, 
+                displayName: user.display_name,
+                avatarUrl: user.avatar_url  },
             participants: participantsRes.rows
         }));
 
-        broadcast(roomId, { type: 'participant.joined', participant: user }, socket);
+        broadcast(roomId, { 
+            type: 'participant.joined', 
+            participant: {
+                id: user.id,
+                username: user.username,
+                displayName: user.display_name,
+                avatarUrl: user.avatar_url
+            } 
+        }, socket);
 
         socket.on('message', async (rawData) => {
             try {
@@ -182,7 +217,7 @@ wss.on('connection', async (socket, request) => {
                         type: 'message.new',
                         message: {
                             ...savedMsg,
-                            userName: user.name,
+                            userName: user.display_name,
                             userAvatarUrl: user.avatar_url
                         }
                     });
