@@ -11,16 +11,6 @@ import { pool } from './db.js';
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-// Add this near the top of your file after initializing 'pool'
-const clearParticipants = async () => {
-    try {
-        await pool.query('DELETE FROM room_participants');
-        console.log("🧹 Tabela de participantes limpa (Reinício do servidor)");
-    } catch (err) {
-        console.error("Erro ao limpar participantes:", err);
-    }
-};
-clearParticipants();
 
 const app = express();
 const server = http.createServer(app);
@@ -54,34 +44,38 @@ app.post('/uploads/avatar', upload.single('file'), (req, res) => {
 });
 
 app.post('/sessions', async (req, res) => {
-    const { name, roomId, avatarUrl } = req.body;
+    const { name, password, roomId, avatarUrl } = req.body;
 
     try {
-        // 1. Ensure the room exists
+        // Room
         await pool.query(
             'INSERT INTO rooms (id) VALUES ($1) ON CONFLICT (id) DO NOTHING',
             [roomId]
         );
 
-        // 2. Create or Update user
-        // Note: Using name as identifier here. In a real app, use email/id.
+        // User
         const userRes = await pool.query(
-            `INSERT INTO users (name, avatar_url) 
-             VALUES ($1, $2) 
-             ON CONFLICT DO NOTHING 
-             RETURNING *`, 
-            [name, avatarUrl]
+            'SELECT * FROM users WHERE name = $1 AND password = $2',
+            [name, password]
         );
         
-        let user = userRes.rows[0];
-        
-        // If user already existed, fetch them
-        if (!user) {
-            const existing = await pool.query('SELECT * FROM users WHERE name = $1', [name]);
-            user = existing.rows[0];
+        let user;
+
+        if (userRes.rows.length > 0) {
+            // Exists
+            user = userRes.rows[0];
+        } else {
+            // Doesn't exist
+            const newUserRes = await pool.query(
+                `INSERT INTO users (name, password, avatar_url) 
+                 VALUES ($1, $2, $3) 
+                 RETURNING *`, 
+                [name, password, avatarUrl]
+            );
+            user = newUserRes.rows[0];
         }
 
-        // 3. Add user to room participants
+        // Participants
         await pool.query(
             'INSERT INTO room_participants (room_id, user_id) VALUES ($1, $2) ON CONFLICT DO NOTHING',
             [roomId, user.id]
@@ -90,7 +84,11 @@ app.post('/sessions', async (req, res) => {
         res.json({
             userId: user.id,
             roomId: roomId,
-            user: user,
+            user: {
+                id: user.id,
+                name: user.name,
+                avatarUrl: user.avatar_url
+            }, //no password
             wsUrl: `ws://192.168.100.25:3333?roomId=${roomId}&userId=${user.id}`
         });
     } catch (err) {
@@ -103,7 +101,7 @@ app.get('/rooms/:roomId/messages', async (req, res) => {
     const { roomId } = req.params;
     try {
         const result = await pool.query(
-            `SELECT m.id, m.content, m.created_at, u.name as "userName", u.avatar_url as "userAvatarUrl"
+            `SELECT m.id, m.user_id as "userId", m.content, m.created_at, u.name as "userName", u.avatar_url as "userAvatarUrl"
              FROM messages m
              JOIN users u ON m.user_id = u.id
              WHERE m.room_id = $1
@@ -142,12 +140,12 @@ wss.on('connection', async (socket, request) => {
     socket.userId = userId;
 
     try {
-        // Fetch user from DB
+        // User <- DB
         const userRes = await pool.query('SELECT * FROM users WHERE id = $1', [userId]);
         const user = userRes.rows[0];
         if (!user) return socket.close();
 
-        // Get all participants in room
+        // Participants in room
         const participantsRes = await pool.query(
             `SELECT u.id, u.name, u.avatar_url as "avatarUrl" 
             FROM users u 
@@ -174,7 +172,7 @@ wss.on('connection', async (socket, request) => {
                     const msgRes = await pool.query(
                         `INSERT INTO messages (room_id, user_id, content) 
                          VALUES ($1, $2, $3) 
-                         RETURNING id, content, created_at`,
+                         RETURNING id, user_id as "userId", content, created_at`,
                         [roomId, userId, data.content]
                     );
 
@@ -194,24 +192,8 @@ wss.on('connection', async (socket, request) => {
             }
         });
 
-        socket.on('close', async () => {
-            try {
-                // 1. Remove from participants table
-                await pool.query(
-                    'DELETE FROM room_participants WHERE room_id = $1 AND user_id = $2',
-                    [roomId, userId]
-                );
-        
-                // 2. Notify others
-                broadcast(roomId, {
-                    type: 'participant.left',
-                    participantId: userId
-                });
-                
-                console.log(`User ${userId} removed from room ${roomId}`);
-            } catch (err) {
-                console.error("Erro ao remover participante:", err);
-            }
+        socket.on('close', () => {
+            
         });
 
     } catch (err) {
