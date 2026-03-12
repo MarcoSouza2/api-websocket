@@ -248,6 +248,7 @@ app.get('/rooms/:roomId/messages', async (req, res) => {
 app.get('/rooms/:roomId/participants', async (req, res) => {
     const { roomId } = req.params;
     try {
+        // Agora buscamos TODOS os participantes registrados na sala, com seus status
         const result = await pool.query(
             `SELECT 
                 u.id,
@@ -327,7 +328,7 @@ wss.on('connection', async (socket, request) => {
             [roomId, userId]
         );
 
-        // Busca lista completa de participantes (online e offline)
+        // Busca lista completa de participantes (online e offline) para enviar ao novo conectado
         const participantsRes = await pool.query(
             `SELECT 
                 u.id, u.username, u.display_name as "displayName", u.avatar_url as "avatarUrl", rp.status
@@ -350,12 +351,13 @@ wss.on('connection', async (socket, request) => {
             participants: participantsRes.rows
         }));
 
+        // Notifica os outros apenas se for a primeira conexão (aba) deste usuário
         if (!alreadyOnline) {
             broadcast(roomId, {
                 type: 'participant.status_change',
                 participantId: userId,
                 status: 'online',
-                participant: {
+                participant: { // Envia dados básicos caso o front precise renderizar um novo card
                     id: user.id,
                     username: user.username,
                     displayName: user.display_name,
