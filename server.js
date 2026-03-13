@@ -22,7 +22,15 @@ const app = express();
 const server = http.createServer(app);
 const wss = new WebSocketServer({ server });
 
-app.use(cors());
+const corsOptions = {
+    origin: 'https://chat-codefique.vercel.app', // Sem barra no final
+    methods: ['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS'],
+    allowedHeaders: ['Content-Type', 'Authorization', 'ngrok-skip-browser-warning'],
+    credentials: true,
+};
+app.use(cors(corsOptions));
+// Importante: Trate explicitamente as requisições OPTIONS (Preflight)
+app.options(/.*/, cors(corsOptions));
 app.use(express.json());
 
 const disconnectTimers = new Map();
@@ -215,6 +223,8 @@ app.post('/sessions', async (req, res) => {
             [roomId, user.id]
         );
 
+        const protocol = WSURL.includes('ngrok') ? 'wss' : 'ws';
+
         res.json({
             userId: user.id,
             roomId,
@@ -224,7 +234,7 @@ app.post('/sessions', async (req, res) => {
                 displayName: user.display_name,
                 avatarUrl: user.avatar_url
             },
-            wsUrl: `ws://${WSURL}?roomId=${roomId}&userId=${user.id}`
+            wsUrl: `${protocol}://${WSURL}?roomId=${roomId}&userId=${user.id}`
         });
     } catch (err) {
         console.error(err);
@@ -237,7 +247,9 @@ app.get('/rooms/:roomId/messages', async (req, res) => {
     try {
         const result = await pool.query(
             `SELECT 
-                m.id, m.user_id as "userId", m.content, m.file_url as "fileUrl", m.created_at,
+                m.id, m.user_id as "userId", m.content, 
+                m.file_url as "fileUrl", m.file_name as "fileName", -- Added file_name
+                m.created_at,
                 u.display_name as "userName", u.avatar_url as "userAvatarUrl"
              FROM messages m
              JOIN users u ON m.user_id = u.id
@@ -380,12 +392,12 @@ wss.on('connection', async (socket, request) => {
                 const data = JSON.parse(rawData.toString());
                 if (data.type === 'message.send') {
                     if (!data.content && !data.fileUrl) return;
-
+                
                     const msgRes = await pool.query(
-                        `INSERT INTO messages (room_id, user_id, content, file_url) 
-                         VALUES ($1, $2, $3, $4) 
-                         RETURNING id, user_id as "userId", content, file_url as "fileUrl", created_at`,
-                        [roomId, userId, data.content || null, data.fileUrl || null]
+                        `INSERT INTO messages (room_id, user_id, content, file_url, file_name) -- Added file_name
+                         VALUES ($1, $2, $3, $4, $5) 
+                         RETURNING id, user_id as "userId", content, file_url as "fileUrl", file_name as "fileName", created_at`,
+                        [roomId, userId, data.content || null, data.fileUrl || null, data.fileName || null] // Added data.fileName
                     );
 
                     const savedMsg = msgRes.rows[0];
@@ -422,6 +434,6 @@ const heartbeatInterval = setInterval(() => {
 
 wss.on('close', () => clearInterval(heartbeatInterval));
 
-server.listen(PORT, LOCAL_IP, () => {
+server.listen(PORT, '0.0.0.0', () => {
     console.log(`✅ Servidor rodando em http://${LOCAL_IP}:${PORT}`);
 });
