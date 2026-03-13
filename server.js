@@ -158,6 +158,13 @@ app.post('/uploads/avatar', upload.single('file'), (req, res) => {
     });
 });
 
+app.post('/uploads/chat', upload.single('file'), (req, res) => {
+    if (!req.file) return res.status(400).json({ error: 'Nenhum arquivo enviado' });
+    res.json({
+        fileUrl: `/uploads/${req.file.filename}`
+    });
+});
+
 app.post('/register', async (req, res) => {
     const { username, password, email, avatarUrl, displayName } = req.body;
     try {
@@ -230,7 +237,7 @@ app.get('/rooms/:roomId/messages', async (req, res) => {
     try {
         const result = await pool.query(
             `SELECT 
-                m.id, m.user_id as "userId", m.content, m.created_at,
+                m.id, m.user_id as "userId", m.content, m.file_url as "fileUrl", m.created_at,
                 u.display_name as "userName", u.avatar_url as "userAvatarUrl"
              FROM messages m
              JOIN users u ON m.user_id = u.id
@@ -372,13 +379,13 @@ wss.on('connection', async (socket, request) => {
             try {
                 const data = JSON.parse(rawData.toString());
                 if (data.type === 'message.send') {
-                    if (!data.content || !String(data.content).trim()) return;
+                    if (!data.content && !data.fileUrl) return;
 
                     const msgRes = await pool.query(
-                        `INSERT INTO messages (room_id, user_id, content) 
-                         VALUES ($1, $2, $3) 
-                         RETURNING id, user_id as "userId", content, created_at`,
-                        [roomId, userId, data.content]
+                        `INSERT INTO messages (room_id, user_id, content, file_url) 
+                         VALUES ($1, $2, $3, $4) 
+                         RETURNING id, user_id as "userId", content, file_url as "fileUrl", created_at`,
+                        [roomId, userId, data.content || null, data.fileUrl || null]
                     );
 
                     const savedMsg = msgRes.rows[0];
